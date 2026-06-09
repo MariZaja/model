@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 np.random.seed(42)
-n = 500
+n = 1000
 
 E_STATES = ["Angry", "Sad", "Happy", "Calm"]
 Q_STATES = ["BAD", "NOISY", "GOOD"]

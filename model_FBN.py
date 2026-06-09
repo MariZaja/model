@@ -69,12 +69,15 @@ def cpd_Q_fn(parents):
 
 
 def cpd_V_fn(parents):
-    beta_0 = param("V_beta_0", tensor(100.0))
-    beta_E = param("V_beta_E", tensor(80.0))
-    beta_Q = param("V_beta_Q", tensor(200.0))
+    beta_0 = param("V_beta_0", tensor(0.0))
+    # one offset per category — no ordering assumed
+    beta_E = param("V_beta_E", tensor([0.0,   80.0, 160.0, 240.0]))  # len = |E_STATES|
+    beta_Q = param("V_beta_Q", tensor([0.0,  200.0, 400.0]))         # len = |Q_STATES|
     sigma  = param("V_sigma",  tensor(60.0), constraint=constraints.positive)
 
-    mu = beta_0 + beta_E * parents["E"] + beta_Q * parents["Q"]
+    e_idx = parents["E"].long()
+    q_idx = parents["Q"].long()
+    mu = beta_0 + beta_E[e_idx] + beta_Q[q_idx]
     return dist.Normal(mu, sigma)
 
 
@@ -85,20 +88,20 @@ def predict_E(df_enc: pd.DataFrame, params: dict) -> pd.DataFrame:
     For each row with observed V and Q, compute P(E | V, Q) and return MAP label.
 
     P(E=e | V, Q) ∝ P(V | E=e, Q) * P(E=e)
-    P(V | E=e, Q)  = Normal(beta_0 + beta_E*e + beta_Q*q, sigma)
+    P(V | E=e, Q)  = Normal(beta_0 + beta_E[e] + beta_Q[q], sigma)
     """
-    beta_0 = params["V_beta_0"].item()
-    beta_E = params["V_beta_E"].item()
-    beta_Q = params["V_beta_Q"].item()
-    sigma  = params["V_sigma"].item()
+    beta_0  = params["V_beta_0"].item()
+    beta_E  = params["V_beta_E"].detach().numpy()   # vector, one value per E category
+    beta_Q  = params["V_beta_Q"].detach().numpy()   # vector, one value per Q category
+    sigma   = params["V_sigma"].item()
     e_prior = params["E_probs"].detach().numpy()
 
     records = []
     for _, row in df_enc.iterrows():
-        v, q = row["V"], row["Q"]
+        v, q = row["V"], int(row["Q"])
 
         posteriors = np.array([
-            scipy_norm.pdf(v, beta_0 + beta_E * e + beta_Q * q, sigma) * e_prior[e]
+            scipy_norm.pdf(v, beta_0 + beta_E[e] + beta_Q[q], sigma) * e_prior[e]
             for e in range(len(E_STATES))
         ])
         posteriors /= posteriors.sum() + 1e-300
@@ -144,18 +147,18 @@ if __name__ == "__main__":
     # ── Build & train ─────────────────────────────────────────────────────────
     model = build_model()
     print("Model structure:", list(model.edges()))
-    print("\nFitting on training set (SVI, 1000 steps)…")
+    print("\nFitting on training set (SVI, 5000 steps)…")
     pyro.clear_param_store()
-    params = model.fit(df_train, estimator="SVI", num_steps=1000, seed=42)
+    params = model.fit(df_train, estimator="SVI", num_steps=5000, seed=42)
 
     print("\n=== Learned parameters ===")
     for name, val in params.items():
         if isinstance(val, torch.Tensor) and val.numel() > 1:
-            formatted = ", ".join(
-                [f"{E_STATES[i]}={v:.3f}" if "E_" in name else
-                 f"{Q_STATES[i]}={v:.3f}" if "Q_" in name else f"{v:.3f}"
-                 for i, v in enumerate(val.tolist())]
-            )
+            labels = E_STATES if "E_" in name else Q_STATES if "Q_" in name else None
+            if labels:
+                formatted = ", ".join(f"{labels[i]}={v:.1f}" for i, v in enumerate(val.tolist()))
+            else:
+                formatted = ", ".join(f"{v:.3f}" for v in val.tolist())
             print(f"  {name}: [{formatted}]")
         else:
             v = val.item() if isinstance(val, torch.Tensor) else val
