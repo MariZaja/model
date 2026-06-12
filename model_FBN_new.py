@@ -1,18 +1,37 @@
+"""
+Model FBN do klasyfikacji emocji — pgmpy FunctionalBayesianNetwork.
+
+Dwa warianty grafu (wybór przez flagę --no-quality):
+
+  Domyślnie (z quality):          --no-quality (bez quality):
+    E ──► V  ◄── Q_audio            E ──► V
+    E ──► V  ◄── Q_video            (Q węzłów brak w grafie)
+    E ──► V  ◄── Q_eeg
+    Q niezależne od E
+
+Uczenie: model.fit(train_df, estimator="SVI") — pgmpy uruchamia Pyro SVI
+Predykcja: ręczna inferencja bayesowska przez scipy_norm.logpdf
+"""
+
 import numpy as np
 import pandas as pd
 import torch
 import pyro
 import pyro.distributions as dist
-from pyro import param
-from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam
-from torch import tensor
 from torch.distributions import constraints
 from scipy.stats import norm as scipy_norm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 
-# ── Encodings ─────────────────────────────────────────────────────────────────
+from pgmpy.global_vars import config
+config.set_backend("torch")
+
+from pgmpy.models import FunctionalBayesianNetwork
+from pgmpy.factors.hybrid import FunctionalCPD
+
+
+# ── Encodings ──────────────────────────────────────────────────────────────────
+
 E_STATES = ["Angry", "Sad", "Happy", "Calm"]
 Q_STATES = ["BAD", "NOISY", "GOOD"]
 
@@ -23,21 +42,24 @@ Q_DEC = {i: s for s, i in Q_ENC.items()}
 
 EMOTION_MAP = {"Anger": "Angry", "Sadness": "Sad", "Happiness": "Happy", "Calm": "Calm"}
 
-V_AUDIO = [f"V{k}" for k in range(1,  21)]   # V1-V20
-V_VIDEO = [f"V{k}" for k in range(21, 41)]   # V21-V40
-V_EEG   = [f"V{k}" for k in range(41, 61)]   # V41-V60
+V_AUDIO = [f"V{k}" for k in range(1,  21)]   # V1–V20
+V_VIDEO = [f"V{k}" for k in range(21, 41)]   # V21–V40
+V_EEG   = [f"V{k}" for k in range(41, 61)]   # V41–V60
 
 MODALITIES = {
-    "audio2": {"q": "Q_audio", "v_cols": V_AUDIO},
-    "video2": {"q": "Q_video", "v_cols": V_VIDEO},
-    "eeg2":   {"q": "Q_eeg",   "v_cols": V_EEG},
+    "audio": {"q": "Q_audio", "v_cols": V_AUDIO},
+    "video": {"q": "Q_video", "v_cols": V_VIDEO},
+    "eeg":   {"q": "Q_eeg",   "v_cols": V_EEG},
 }
 
+N_E = len(E_STATES)   # 4
+N_Q = len(Q_STATES)   # 3
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+
+# ── Data loading ───────────────────────────────────────────────────────────────
 
 def load_data(data_dir: str = "dane") -> pd.DataFrame:
-    dq = pd.read_csv("prep/e02_data_quality_prep.csv")
+    dq = pd.read_csv("prep/e01_data_quality_prep.csv")
     dq[["trial_id", "window_id"]] = (
         dq["window_id"].str.split("_", expand=True).astype(int)
     )
@@ -66,95 +88,178 @@ def load_data(data_dir: str = "dane") -> pd.DataFrame:
     return base
 
 
-# ── Tensor preparation ────────────────────────────────────────────────────────
+# ── Przygotowanie DataFrame do fit() ──────────────────────────────────────────
 
-def prepare_tensors(df: pd.DataFrame) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    tensors["E"] = torch.tensor(df["E"].map(E_ENC).values, dtype=torch.float32)
-    for mod, cfg in MODALITIES.items():
-        q_col = cfg["q"]
-        q_vals = df[q_col].map(
-            lambda x: float(Q_ENC[x]) if (pd.notna(x) and x in Q_ENC) else float("nan")
+def prepare_fit_df(df: pd.DataFrame, use_quality: bool) -> pd.DataFrame:
+    """Koduje E i Q na int. Jeśli use_quality=False, kolumny Q są pomijane."""
+    out = df.copy()
+    out["E"] = out["E"].map(E_ENC)
+    if use_quality:
+        for cfg in MODALITIES.values():
+            q_col = cfg["q"]
+            out[q_col] = out[q_col].map(
+                lambda x: Q_ENC[x] if (pd.notna(x) and x in Q_ENC) else np.nan
+            )
+    return out
+
+
+# ── CPD — węzeł E (wspólny dla obu modeli) ────────────────────────────────────
+
+def cpd_fn_E(_parents):
+    """Marginalny rozkład emocji P(E) — uczony jako simplex."""
+    e_probs = pyro.param(
+        "E_probs",
+        torch.ones(N_E) / N_E,
+        constraint=constraints.simplex,
+    )
+    return dist.Categorical(probs=e_probs)
+
+
+# ── CPD — węzeł Q (tylko w modelu z quality) ──────────────────────────────────
+
+def make_cpd_fn_Q(q_name: str):
+    """Marginalny rozkład jakości P(Q) — Q niezależne od E."""
+    def fn(_parents):
+        q_probs = pyro.param(
+            f"{q_name}_probs",
+            torch.ones(N_Q) / N_Q,
+            constraint=constraints.simplex,
         )
-        tensors[q_col] = torch.tensor(q_vals.values, dtype=torch.float32)
+        return dist.Categorical(probs=q_probs)
+    return fn
+
+
+# ── CPD — węzeł V z quality: mu = beta0 + betaE[E] + betaQ[Q] ────────────────
+
+def make_cpd_fn_V_with_quality(v_name: str, q_name: str):
+    """V zależy od E i Q. Rodzice: [E, Q_mod]."""
+    def fn(parents):
+        beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
+        beta_E = pyro.param(f"{v_name}_beta_E", torch.zeros(N_E))
+        beta_Q = pyro.param(f"{v_name}_beta_Q", torch.zeros(N_Q))
+        sigma  = pyro.param(
+            f"{v_name}_sigma",
+            torch.tensor(1.0),
+            constraint=constraints.positive,
+        )
+        e_idx = parents["E"].long()
+        q_idx = parents[q_name].long()
+        mu = beta_0 + beta_E[e_idx] + beta_Q[q_idx]
+        return dist.Normal(mu, sigma)
+    return fn
+
+
+# ── CPD — węzeł V bez quality: mu = beta0 + betaE[E] ─────────────────────────
+
+def make_cpd_fn_V_no_quality(v_name: str):
+    """V zależy tylko od E. Rodzice: [E]."""
+    def fn(parents):
+        beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
+        beta_E = pyro.param(f"{v_name}_beta_E", torch.zeros(N_E))
+        sigma  = pyro.param(
+            f"{v_name}_sigma",
+            torch.tensor(1.0),
+            constraint=constraints.positive,
+        )
+        e_idx = parents["E"].long()
+        mu = beta_0 + beta_E[e_idx]
+        return dist.Normal(mu, sigma)
+    return fn
+
+
+# ── Budowanie modelu ───────────────────────────────────────────────────────────
+
+def build_model(use_quality: bool) -> FunctionalBayesianNetwork:
+    """
+    Buduje jeden z dwóch wariantów FBN:
+
+    use_quality=True  → E──►V◄──Q  (krawędzie E→V i Q→V, Q bez rodziców)
+    use_quality=False → E──►V       (tylko krawędzie E→V, brak węzłów Q)
+    """
+    edges = []
+    for cfg in MODALITIES.values():
+        q_col = cfg["q"]
         for v_name in cfg["v_cols"]:
-            tensors[v_name] = torch.tensor(df[v_name].values, dtype=torch.float32)
-    return tensors
-
-
-# ── Joint Pyro model ──────────────────────────────────────────────────────────
-
-def joint_model(tensors: dict[str, torch.Tensor], use_quality: bool) -> None:
-    N     = tensors["E"].shape[0]
-    E_obs = tensors["E"].long()
-
-    e_probs = param("E_probs", tensor([0.25, 0.25, 0.25, 0.25]),
-                    constraint=constraints.simplex)
-
-    with pyro.plate("obs", N):
-        pyro.sample("E", dist.Categorical(probs=e_probs), obs=E_obs)
-
-        for mod, cfg in MODALITIES.items():
-            q_name = cfg["q"]
-            q_raw  = tensors[q_name]                    # float, NaN = missing
-            avail  = ~torch.isnan(q_raw)                # [N] bool mask
-            safe_q = q_raw.where(avail, torch.zeros_like(q_raw)).long()
-
-            q_probs = param(f"{q_name}_probs", tensor([1/3, 1/3, 1/3]),
-                            constraint=constraints.simplex)
-
+            edges.append(("E", v_name))          # E ──► V  (oba modele)
             if use_quality:
-                with pyro.poutine.mask(mask=avail):
-                    pyro.sample(q_name, dist.Categorical(probs=q_probs), obs=safe_q)
+                edges.append((q_col, v_name))    # Q ──► V  (tylko with-quality)
 
-            for v_name in cfg["v_cols"]:
-                v_raw  = tensors[v_name]
-                v_mask = avail & ~torch.isnan(v_raw)
-                safe_v = v_raw.where(v_mask, torch.zeros_like(v_raw))
+    model = FunctionalBayesianNetwork(edges)
 
-                beta_0 = param(f"{v_name}_beta_0", tensor(0.0))
-                beta_E = param(f"{v_name}_beta_E", tensor([0.0, 0.0, 0.0, 0.0]))
-                sigma  = param(f"{v_name}_sigma",  tensor(1.0),
-                               constraint=constraints.positive)
+    # Węzeł E — zawsze
+    model.add_cpds(FunctionalCPD("E", fn=cpd_fn_E))
 
-                if use_quality:
-                    beta_Q = param(f"{v_name}_beta_Q", tensor([0.0, 0.0, 0.0]))
-                    mu = beta_0 + beta_E[E_obs] + beta_Q[safe_q]
-                else:
-                    mu = beta_0 + beta_E[E_obs]
+    for cfg in MODALITIES.values():
+        q_col = cfg["q"]
 
-                with pyro.poutine.mask(mask=v_mask):
-                    pyro.sample(v_name, dist.Normal(mu, sigma), obs=safe_v)
+        if use_quality:
+            # Węzeł Q — tylko w modelu z quality
+            model.add_cpds(
+                FunctionalCPD(q_col, fn=make_cpd_fn_Q(q_col))
+            )
+
+        for v_name in cfg["v_cols"]:
+            if use_quality:
+                model.add_cpds(
+                    FunctionalCPD(
+                        v_name,
+                        fn=make_cpd_fn_V_with_quality(v_name, q_col),
+                        parents=["E", q_col],
+                    )
+                )
+            else:
+                model.add_cpds(
+                    FunctionalCPD(
+                        v_name,
+                        fn=make_cpd_fn_V_no_quality(v_name),
+                        parents=["E"],
+                    )
+                )
+
+    assert model.check_model(), "Graf FBN jest niepoprawny — sprawdź krawędzie i CPD!"
+    return model
 
 
-def joint_guide(tensors: dict[str, torch.Tensor], use_quality: bool) -> None:
-    pass
+# ── Uczenie ───────────────────────────────────────────────────────────────────
 
-
-# ── Joint training ────────────────────────────────────────────────────────────
-
-def train_joint(
+def train(
+    model: FunctionalBayesianNetwork,
     train_df: pd.DataFrame,
     use_quality: bool,
-    num_steps: int = 3000,
-    seed: int = 42,
+    num_steps: int = 5000,
+    lr: float = 0.005,
+    seed: int = 7,
 ) -> dict[str, torch.Tensor]:
+    """
+    Dopasowuje model do danych treningowych przez SVI (Pyro pod spodem).
+    Zwraca słownik parametrów z pyro.get_param_store().
+    """
     pyro.set_rng_seed(seed)
     pyro.clear_param_store()
-    tensors = prepare_tensors(train_df)
 
-    svi = SVI(joint_model, joint_guide, Adam({"lr": 0.01}), loss=Trace_ELBO())
+    fit_df = prepare_fit_df(train_df, use_quality)
 
-    print(f"Joint training (SVI, {num_steps} steps, {len(train_df)} rows)…")
-    for step in range(num_steps):
-        loss = svi.step(tensors, use_quality)
-        if step % 1000 == 0:
-            print(f"  step {step:5d}  loss = {loss:.2f}")
+    # Kolumny wymagane przez dany wariant modelu
+    q_cols    = [cfg["q"] for cfg in MODALITIES.values()]
+    all_v_cols = V_AUDIO + V_VIDEO + V_EEG
+    drop_cols  = (q_cols + all_v_cols) if use_quality else all_v_cols
+    fit_df = fit_df.dropna(subset=drop_cols).reset_index(drop=True)
 
-    return {k: v.detach().clone() for k, v in pyro.get_param_store().items()}
+    mode_label = "z quality (E→V◄Q)" if use_quality else "bez quality (E→V)"
+    print(f"Uczenie FBN [{mode_label}] na {len(fit_df)} oknach…")
+
+    params = model.fit(
+        fit_df,
+        estimator="SVI",
+        optimizer=pyro.optim.Adam({"lr": lr}),
+        num_steps=num_steps,
+        seed=seed,
+    )
+
+    return {k: v.detach().clone() for k, v in params.items()}
 
 
-# ── Combined inference P(E | all_V, all_Q) ───────────────────────────────────
+# ── Inferencja P(E | V, Q) ────────────────────────────────────────────────────
 
 def predict_E(
     test_df: pd.DataFrame,
@@ -166,12 +271,17 @@ def predict_E(
     for _, row in test_df.iterrows():
         log_liks = np.zeros(len(E_STATES))
 
-        for mod, cfg in MODALITIES.items():
+        for cfg in MODALITIES.values():
             q_col = cfg["q"]
-
             if pd.isna(row[q_col]):
                 continue
-            q = int(Q_ENC[row[q_col]]) if use_quality else None
+
+            if use_quality:
+                if pd.isna(row[q_col]):
+                    continue
+                q = int(Q_ENC[row[q_col]])
+            else:
+                q = None
 
             for v_name in cfg["v_cols"]:
                 v_val = row[v_name]
@@ -202,7 +312,7 @@ def predict_E(
     return pd.DataFrame(records)
 
 
-# ── KL information-gain matrix  I(m,q) = E[KL(P(E|X_m,Q) ‖ P(E|Q))] ─────────
+# ── KL information-gain matrix ────────────────────────────────────────────────
 
 def compute_kl_matrix(
     df: pd.DataFrame,
@@ -256,6 +366,9 @@ def compute_kl_matrix(
 
     return pd.DataFrame(rows).T[["Q_high", "Q_med", "Q_low"]]
 
+
+
+# ── KL information-gain matrix per emocja ────────────────────────────────────
 
 def compute_kl_matrix_per_emotion(
     df: pd.DataFrame,
@@ -325,25 +438,27 @@ def compute_kl_matrix_per_emotion(
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--quality", action="store_true",
-                        help="Include quality (Q) nodes as parents of V features")
+    parser = argparse.ArgumentParser(description="FBN klasyfikacja emocji")
+    parser.add_argument(
+        "--no-quality", action="store_true",
+        help="Użyj modelu bez węzłów Q (tylko E→V). Domyślnie: z quality (E→V◄Q).",
+    )
+    parser.add_argument("--steps", type=int, default=3000)
     args = parser.parse_args()
-    use_quality = args.quality
+    use_quality = not args.no_quality
 
-    print(f"Mode: {'with quality (Q nodes active)' if use_quality else 'without quality (E only)'}")
-    print("Loading data from dane/…")
+    print(f"Tryb: {'z quality (E→V◄Q)' if use_quality else 'bez quality (E→V)'}\n")
+
+    print("Wczytywanie danych…")
     df_all = load_data()
-
-    print(f"  Total rows: {len(df_all)}")
-    print(f"  E distribution: {df_all['E'].value_counts().to_dict()}")
-    for mod, cfg in MODALITIES.items():
+    print(f"  Łącznie okien: {len(df_all)}")
+    print(f"  Rozkład E: {df_all['E'].value_counts().to_dict()}")
+    for cfg in MODALITIES.values():
         n = df_all[cfg["q"]].notna().sum()
-        print(f"  {mod}: {n} rows with quality label  |  "
-              f"Q: {df_all[cfg['q']].value_counts(dropna=True).to_dict()}")
+        print(f"  {cfg['q']}: {n} okien z etykietą jakości  "
+              f"| {df_all[cfg['q']].value_counts(dropna=True).to_dict()}")
 
-    # ── Quality class helper ──────────────────────────────────────────────────
-    # "GOOD" = all available channels are GOOD; "LOW" = at least one is BAD/NOISY
+    # Stratyfikowany podział (E × klasa jakości)
     def _qual_class(row):
         for cfg in MODALITIES.values():
             q = row[cfg["q"]]
@@ -354,51 +469,38 @@ if __name__ == "__main__":
     df_all["_qual_class"] = df_all.apply(_qual_class, axis=1)
     strat_key = df_all["E"] + "_" + df_all["_qual_class"]
 
-    print(f"\n  Quality distribution:  "
-          f"all-GOOD={( df_all['_qual_class']=='GOOD').sum()}  "
-          f"lower={(df_all['_qual_class']=='LOW').sum()}")
-
-    # ── Stratified train / test split (E × quality class) ────────────────────
     train_df, test_df = train_test_split(
         df_all, test_size=0.2, random_state=42, stratify=strat_key
     )
     train_df = train_df.drop(columns=["_qual_class"]).reset_index(drop=True)
-    test_df  = test_df.reset_index(drop=True)          # keep _qual_class for split below
-
-    # ── Split test → test1 (all GOOD) / test2 (lower quality) ────────────────
     test1_df = test_df[test_df["_qual_class"] == "GOOD"].drop(columns=["_qual_class"]).reset_index(drop=True)
     test2_df = test_df[test_df["_qual_class"] == "LOW" ].drop(columns=["_qual_class"]).reset_index(drop=True)
     test_df  = test_df.drop(columns=["_qual_class"]).reset_index(drop=True)
 
-    print(f"\n  train: {len(train_df)} rows")
-    print(f"  test:  {len(test_df)} rows  "
-          f"(test1 all-GOOD: {len(test1_df)},  test2 lower-quality: {len(test2_df)})\n")
+    print(f"\n  Train: {len(train_df)} | Test: {len(test_df)} "
+          f"(all-GOOD: {len(test1_df)}, lower-quality: {len(test2_df)})\n")
 
-    # ── Joint training over all modalities ────────────────────────────────────
-    params = train_joint(train_df, use_quality)
+    # Buduj właściwy wariant modelu i ucz
+    model  = build_model(use_quality)
+    params = train(model, train_df, use_quality, num_steps=args.steps)
 
-    # Print high-level learned parameters
     e_vals = params["E_probs"].tolist()
     print(f"\n  E_probs: [{', '.join(f'{E_STATES[i]}={v:.3f}' for i, v in enumerate(e_vals))}]")
-    for mod, cfg in MODALITIES.items():
-        q_name = cfg["q"]
-        q_vals = params[f"{q_name}_probs"].tolist()
-        print(f"  {q_name}_probs: [{', '.join(f'{Q_STATES[i]}={v:.3f}' for i, v in enumerate(q_vals))}]")
-
     e_prior = params["E_probs"].detach().numpy()
 
-    # ── KL information-gain matrix ────────────────────────────────────────────
-    print("\nKL information-gain matrix  I = E[KL(P(E|X_m,Q) ‖ P(E|Q))]:")
+    # KL matrix
+    print("\nMacierz KL  I(mod, Q):")
     kl_mat = compute_kl_matrix(train_df, params, e_prior, use_quality)
-    print(kl_mat.round(2).to_string())
+    print(kl_mat.round(3).to_string())
 
-    print("\nKL information-gain matrix per emotion  I = E[KL(P(E|X_m,Q) ‖ P(E|Q)) | E_true=e]:")
+    # KL matrix per emocja
+    print("Macierz KL per emocja  I = E[KL(P(E|X_m,Q) ‖ P(E)) | E_true=e]:")
     kl_per_e = compute_kl_matrix_per_emotion(train_df, params, e_prior, use_quality)
     for e_name, mat in kl_per_e.items():
-        print(f"\n  E = {e_name}:")
-        print(mat.round(2).to_string())
+        print(f"E = {e_name}:")
+        print(mat.round(3).to_string())
 
-    # ── Evaluation helper ─────────────────────────────────────────────────────
+    # Ewaluacja
     def evaluate(df: pd.DataFrame, label: str) -> None:
         if len(df) == 0:
             print(f"\n=== {label} — brak próbek ===")
@@ -406,11 +508,15 @@ if __name__ == "__main__":
         print(f"\n=== {label} ({len(df)} próbek) ===")
         res = predict_E(df, params, e_prior, use_quality)
         acc = accuracy_score(res["E_true"], res["E_pred"])
-        print(f"\nAccuracy: {acc:.3f}  ({int(acc * len(res))}/{len(res)} correct)\n")
-        print(classification_report(res["E_true"], res["E_pred"],
-                                    target_names=E_STATES, zero_division=0))
+        print(f"Accuracy: {acc:.3f}  ({int(acc * len(res))}/{len(res)})\n")
+        print(classification_report(
+            res["E_true"],
+            res["E_pred"],
+            labels=E_STATES,
+            target_names=E_STATES,
+            zero_division=0,)
+        )
 
-    # ── Testing ───────────────────────────────────────────────────────────────
-    evaluate(test_df,  "Test — cały zbiór testowy")
-    evaluate(test1_df, "Test1 — tylko próbki all-GOOD")
-    evaluate(test2_df, "Test2 — próbki niższej jakości")
+    evaluate(test_df,  "Test — cały zbiór")
+    evaluate(test1_df, "Test1 — all-GOOD")
+    evaluate(test2_df, "Test2 — lower-quality")
