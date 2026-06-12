@@ -9,6 +9,12 @@ Dwa warianty grafu (wybór przez flagę --no-quality):
     E ──► V  ◄── Q_eeg
     Q niezależne od E
 
+W modelu z quality jakość Q wchodzi do CPD węzła V na DWA sposoby:
+  * addytywnie do średniej:  mu = beta0 + betaE[E] + betaQ[Q]   (systematyczny bias)
+  * przez odchylenie std:    sigma = sigma_q[Q]                 (poziom szumu)
+Dzięki sigma_q[BAD] > sigma_q[GOOD] zaszumiona modalność daje płaski likelihood
+i automatycznie waży się niżej w posteriorze (quality-aware down-weighting).
+
 Uczenie: model.fit(train_df, estimator="SVI") — pgmpy uruchamia Pyro SVI
 Predykcja: ręczna inferencja bayesowska przez scipy_norm.logpdf
 """
@@ -34,6 +40,9 @@ from pgmpy.factors.hybrid import FunctionalCPD
 
 E_STATES = ["Angry", "Sad", "Happy", "Calm"]
 Q_STATES = ["BAD", "NOISY", "GOOD"]
+
+E_BASE = "Calm"
+Q_BASE = "GOOD"
 
 E_ENC = {s: i for i, s in enumerate(E_STATES)}
 Q_ENC = {s: i for i, s in enumerate(Q_STATES)}
@@ -102,6 +111,43 @@ def prepare_fit_df(df: pd.DataFrame, use_quality: bool) -> pd.DataFrame:
             )
     return out
 
+def expand_reference_effect(
+    raw: torch.Tensor,
+    n_states: int,
+    base_idx: int,
+) -> torch.Tensor:
+    """
+    Zamienia wektor długości n_states - 1 na pełny wektor efektów,
+    w którym efekt klasy bazowej wynosi 0.
+    """
+    parts = []
+    raw_i = 0
+
+    for i in range(n_states):
+        if i == base_idx:
+            parts.append(torch.tensor(0.0, dtype=raw.dtype, device=raw.device))
+        else:
+            parts.append(raw[raw_i])
+            raw_i += 1
+
+    return torch.stack(parts)
+
+def expand_reference_effect_np(
+    raw: np.ndarray,
+    n_states: int,
+    base_idx: int,
+) -> np.ndarray:
+    full = np.zeros(n_states)
+    raw_i = 0
+
+    for i in range(n_states):
+        if i == base_idx:
+            full[i] = 0.0
+        else:
+            full[i] = raw[raw_i]
+            raw_i += 1
+
+    return full
 
 # ── CPD — węzeł E (wspólny dla obu modeli) ────────────────────────────────────
 
@@ -129,22 +175,53 @@ def make_cpd_fn_Q(q_name: str):
     return fn
 
 
-# ── CPD — węzeł V z quality: mu = beta0 + betaE[E] + betaQ[Q] ────────────────
+# ── CPD — węzeł V z quality: mu = beta0 + betaE[E] + betaQ[Q], sigma = sigma_q[Q] ──
 
 def make_cpd_fn_V_with_quality(v_name: str, q_name: str):
-    """V zależy od E i Q. Rodzice: [E, Q_mod]."""
+    """
+    V zależy od E i Q. Rodzice: [E, Q_mod].
+
+    Jakość Q wchodzi do CPD na dwa sposoby:
+      * mu    = beta0 + betaE[E] + betaQ[Q]   — addytywny bias zależny od jakości,
+      * sigma = sigma_q[Q]                     — poziom szumu zależny od jakości.
+
+    sigma_q to wektor długości N_Q (osobne odchylenie std dla GOOD / NOISY / BAD).
+    Gdy model nauczy się sigma_q[BAD] > sigma_q[GOOD], likelihood zaszumionej
+    modalności jest płaski → słabo rusza posteriorem → modalność dyskontuje się
+    automatycznie (quality-aware down-weighting).
+    """
     def fn(parents):
         beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
-        beta_E = pyro.param(f"{v_name}_beta_E", torch.zeros(N_E))
-        beta_Q = pyro.param(f"{v_name}_beta_Q", torch.zeros(N_Q))
-        sigma  = pyro.param(
-            f"{v_name}_sigma",
-            torch.tensor(1.0),
+
+        beta_E_raw = pyro.param(
+            f"{v_name}_beta_E_raw",
+            torch.zeros(N_E - 1),
+        )
+
+        beta_Q_raw = pyro.param(
+            f"{v_name}_beta_Q_raw",
+            torch.zeros(N_Q - 1),
+        )
+
+        # Osobne sigma na każdy poziom jakości (GOOD / NOISY / BAD)
+        sigma_q = pyro.param(
+            f"{v_name}_sigma_q",
+            torch.ones(N_Q),
             constraint=constraints.positive,
         )
+
+        e_base_idx = E_ENC[E_BASE]
+        q_base_idx = Q_ENC[Q_BASE]
+
+        beta_E = expand_reference_effect(beta_E_raw, N_E, e_base_idx)
+        beta_Q = expand_reference_effect(beta_Q_raw, N_Q, q_base_idx)
+
         e_idx = parents["E"].long()
         q_idx = parents[q_name].long()
-        mu = beta_0 + beta_E[e_idx] + beta_Q[q_idx]
+
+        mu    = beta_0 + beta_E[e_idx] + beta_Q[q_idx]
+        sigma = sigma_q[q_idx]
+
         return dist.Normal(mu, sigma)
     return fn
 
@@ -152,17 +229,27 @@ def make_cpd_fn_V_with_quality(v_name: str, q_name: str):
 # ── CPD — węzeł V bez quality: mu = beta0 + betaE[E] ─────────────────────────
 
 def make_cpd_fn_V_no_quality(v_name: str):
-    """V zależy tylko od E. Rodzice: [E]."""
+    """V zależy tylko od E. Rodzice: [E]. sigma skalarne (brak węzła Q)."""
     def fn(parents):
         beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
-        beta_E = pyro.param(f"{v_name}_beta_E", torch.zeros(N_E))
-        sigma  = pyro.param(
+
+        beta_E_raw = pyro.param(
+            f"{v_name}_beta_E_raw",
+            torch.zeros(N_E - 1),
+        )
+
+        sigma = pyro.param(
             f"{v_name}_sigma",
             torch.tensor(1.0),
             constraint=constraints.positive,
         )
+
+        e_base_idx = E_ENC[E_BASE]
+        beta_E = expand_reference_effect(beta_E_raw, N_E, e_base_idx)
+
         e_idx = parents["E"].long()
         mu = beta_0 + beta_E[e_idx]
+
         return dist.Normal(mu, sigma)
     return fn
 
@@ -272,11 +359,9 @@ def predict_E(
         log_liks = np.zeros(len(E_STATES))
 
         for cfg in MODALITIES.values():
-            q_col = cfg["q"]
-            if pd.isna(row[q_col]):
-                continue
 
             if use_quality:
+                q_col = cfg["q"]
                 if pd.isna(row[q_col]):
                     continue
                 q = int(Q_ENC[row[q_col]])
@@ -288,13 +373,25 @@ def predict_E(
                 if pd.isna(v_val):
                     continue
                 b0  = params[f"{v_name}_beta_0"].item()
-                bE  = params[f"{v_name}_beta_E"].detach().numpy()
-                sig = params[f"{v_name}_sigma"].item()
+                bE_raw = params[f"{v_name}_beta_E_raw"].detach().numpy()
+                bE = expand_reference_effect_np(
+                    bE_raw,
+                    N_E,
+                    E_ENC[E_BASE],
+                )
                 if use_quality:
-                    bQ     = params[f"{v_name}_beta_Q"].detach().numpy()
+                    bQ_raw = params[f"{v_name}_beta_Q_raw"].detach().numpy()
+                    bQ = expand_reference_effect_np(
+                        bQ_raw,
+                        N_Q,
+                        Q_ENC[Q_BASE],
+                    )
                     mu_arr = b0 + bE + bQ[q]
+                    # sigma zależy od jakości Q (stałe względem E)
+                    sig = float(params[f"{v_name}_sigma_q"].detach().numpy()[q])
                 else:
                     mu_arr = b0 + bE
+                    sig = params[f"{v_name}_sigma"].item()
                 for e in range(len(E_STATES)):
                     log_liks[e] += scipy_norm.logpdf(v_val, mu_arr[e], sig)
 
@@ -338,13 +435,24 @@ def compute_kl_matrix(
                 if pd.isna(v_val):
                     continue
                 b0  = params[f"{v_name}_beta_0"].item()
-                bE  = params[f"{v_name}_beta_E"].detach().numpy()
-                sig = params[f"{v_name}_sigma"].item()
+                bE_raw = params[f"{v_name}_beta_E_raw"].detach().numpy()
+                bE = expand_reference_effect_np(
+                    bE_raw,
+                    N_E,
+                    E_ENC[E_BASE],
+                )
                 if use_quality:
-                    bQ     = params[f"{v_name}_beta_Q"].detach().numpy()
+                    bQ_raw = params[f"{v_name}_beta_Q_raw"].detach().numpy()
+                    bQ = expand_reference_effect_np(
+                        bQ_raw,
+                        N_Q,
+                        Q_ENC[Q_BASE],
+                    )
                     mu_arr = b0 + bE + bQ[q_idx]
+                    sig = float(params[f"{v_name}_sigma_q"].detach().numpy()[q_idx])
                 else:
                     mu_arr = b0 + bE
+                    sig = params[f"{v_name}_sigma"].item()
                 for e in range(len(E_STATES)):
                     log_liks[e] += scipy_norm.logpdf(v_val, mu_arr[e], sig)
 
@@ -399,13 +507,24 @@ def compute_kl_matrix_per_emotion(
                 if pd.isna(v_val):
                     continue
                 b0  = params[f"{v_name}_beta_0"].item()
-                bE  = params[f"{v_name}_beta_E"].detach().numpy()
-                sig = params[f"{v_name}_sigma"].item()
+                bE_raw = params[f"{v_name}_beta_E_raw"].detach().numpy()
+                bE = expand_reference_effect_np(
+                    bE_raw,
+                    N_E,
+                    E_ENC[E_BASE],
+                )
                 if use_quality:
-                    bQ     = params[f"{v_name}_beta_Q"].detach().numpy()
+                    bQ_raw = params[f"{v_name}_beta_Q_raw"].detach().numpy()
+                    bQ = expand_reference_effect_np(
+                        bQ_raw,
+                        N_Q,
+                        Q_ENC[Q_BASE],
+                    )
                     mu_arr = b0 + bE + bQ[q_idx]
+                    sig = float(params[f"{v_name}_sigma_q"].detach().numpy()[q_idx])
                 else:
                     mu_arr = b0 + bE
+                    sig = params[f"{v_name}_sigma"].item()
                 for e in range(len(E_STATES)):
                     log_liks[e] += scipy_norm.logpdf(v_val, mu_arr[e], sig)
 
@@ -432,6 +551,24 @@ def compute_kl_matrix_per_emotion(
         result[e_name] = pd.DataFrame(rows).T[["Q_high", "Q_med", "Q_low"]]
 
     return result
+
+
+# ── Diagnostyka sigma_q ──────────────────────────────────────────────────────
+
+def print_sigma_q(params: dict[str, torch.Tensor]) -> None:
+    """Średnie sigma_q po cechach, per modalność i poziom jakości.
+    Sprawdza, czy model rzeczywiście dyskontuje niską jakość (BAD > NOISY > GOOD)."""
+    print("\nŚrednie sigma_q (po cechach) — oczekiwane: BAD > NOISY > GOOD:")
+    for mod, cfg in MODALITIES.items():
+        sig_means = {
+            Q_STATES[qi]: float(np.mean([
+                params[f"{v}_sigma_q"].detach().numpy()[qi]
+                for v in cfg["v_cols"]
+            ]))
+            for qi in range(N_Q)
+        }
+        print(f"  {mod:6s}: " +
+              "  ".join(f"{q}={sig_means[q]:.3f}" for q in Q_STATES))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -487,6 +624,10 @@ if __name__ == "__main__":
     e_vals = params["E_probs"].tolist()
     print(f"\n  E_probs: [{', '.join(f'{E_STATES[i]}={v:.3f}' for i, v in enumerate(e_vals))}]")
     e_prior = params["E_probs"].detach().numpy()
+
+    # Diagnostyka sigma_q — tylko w modelu z quality
+    if use_quality:
+        print_sigma_q(params)
 
     # KL matrix
     print("\nMacierz KL  I(mod, Q):")
