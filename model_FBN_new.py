@@ -35,6 +35,9 @@ from pgmpy.factors.hybrid import FunctionalCPD
 E_STATES = ["Angry", "Sad", "Happy", "Calm"]
 Q_STATES = ["BAD", "NOISY", "GOOD"]
 
+E_BASE = "Calm"
+Q_BASE = "GOOD"
+
 E_ENC = {s: i for i, s in enumerate(E_STATES)}
 Q_ENC = {s: i for i, s in enumerate(Q_STATES)}
 E_DEC = {i: s for s, i in E_ENC.items()}
@@ -102,6 +105,43 @@ def prepare_fit_df(df: pd.DataFrame, use_quality: bool) -> pd.DataFrame:
             )
     return out
 
+def expand_reference_effect(
+    raw: torch.Tensor,
+    n_states: int,
+    base_idx: int,
+) -> torch.Tensor:
+    """
+    Zamienia wektor długości n_states - 1 na pełny wektor efektów,
+    w którym efekt klasy bazowej wynosi 0.
+    """
+    parts = []
+    raw_i = 0
+
+    for i in range(n_states):
+        if i == base_idx:
+            parts.append(torch.tensor(0.0, dtype=raw.dtype, device=raw.device))
+        else:
+            parts.append(raw[raw_i])
+            raw_i += 1
+
+    return torch.stack(parts)
+
+def expand_reference_effect_np(
+    raw: np.ndarray,
+    n_states: int,
+    base_idx: int,
+) -> np.ndarray:
+    full = np.zeros(n_states)
+    raw_i = 0
+
+    for i in range(n_states):
+        if i == base_idx:
+            full[i] = 0.0
+        else:
+            full[i] = raw[raw_i]
+            raw_i += 1
+
+    return full
 
 # ── CPD — węzeł E (wspólny dla obu modeli) ────────────────────────────────────
 
@@ -135,16 +175,34 @@ def make_cpd_fn_V_with_quality(v_name: str, q_name: str):
     """V zależy od E i Q. Rodzice: [E, Q_mod]."""
     def fn(parents):
         beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
-        beta_E = pyro.param(f"{v_name}_beta_E", torch.zeros(N_E))
-        beta_Q = pyro.param(f"{v_name}_beta_Q", torch.zeros(N_Q))
-        sigma  = pyro.param(
+
+        beta_E_raw = pyro.param(
+            f"{v_name}_beta_E_raw",
+            torch.zeros(N_E - 1),
+        )
+
+        beta_Q_raw = pyro.param(
+            f"{v_name}_beta_Q_raw",
+            torch.zeros(N_Q - 1),
+        )
+
+        sigma = pyro.param(
             f"{v_name}_sigma",
             torch.tensor(1.0),
             constraint=constraints.positive,
         )
+
+        e_base_idx = E_ENC["Calm"]
+        q_base_idx = Q_ENC["GOOD"]
+
+        beta_E = expand_reference_effect(beta_E_raw, N_E, e_base_idx)
+        beta_Q = expand_reference_effect(beta_Q_raw, N_Q, q_base_idx)
+
         e_idx = parents["E"].long()
         q_idx = parents[q_name].long()
+
         mu = beta_0 + beta_E[e_idx] + beta_Q[q_idx]
+
         return dist.Normal(mu, sigma)
     return fn
 
@@ -155,14 +213,24 @@ def make_cpd_fn_V_no_quality(v_name: str):
     """V zależy tylko od E. Rodzice: [E]."""
     def fn(parents):
         beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
-        beta_E = pyro.param(f"{v_name}_beta_E", torch.zeros(N_E))
-        sigma  = pyro.param(
+
+        beta_E_raw = pyro.param(
+            f"{v_name}_beta_E_raw",
+            torch.zeros(N_E - 1),
+        )
+
+        sigma = pyro.param(
             f"{v_name}_sigma",
             torch.tensor(1.0),
             constraint=constraints.positive,
         )
+
+        e_base_idx = E_ENC["Calm"]
+        beta_E = expand_reference_effect(beta_E_raw, N_E, e_base_idx)
+
         e_idx = parents["E"].long()
         mu = beta_0 + beta_E[e_idx]
+
         return dist.Normal(mu, sigma)
     return fn
 
@@ -288,10 +356,20 @@ def predict_E(
                 if pd.isna(v_val):
                     continue
                 b0  = params[f"{v_name}_beta_0"].item()
-                bE  = params[f"{v_name}_beta_E"].detach().numpy()
+                bE_raw = params[f"{v_name}_beta_E_raw"].detach().numpy()
+                bE = expand_reference_effect_np(
+                    bE_raw,
+                    N_E,
+                    E_ENC["Calm"],
+                )
                 sig = params[f"{v_name}_sigma"].item()
                 if use_quality:
-                    bQ     = params[f"{v_name}_beta_Q"].detach().numpy()
+                    bQ_raw = params[f"{v_name}_beta_Q_raw"].detach().numpy()
+                    bQ = expand_reference_effect_np(
+                        bQ_raw,
+                        N_Q,
+                        Q_ENC["GOOD"],
+                    )
                     mu_arr = b0 + bE + bQ[q]
                 else:
                     mu_arr = b0 + bE
@@ -338,10 +416,20 @@ def compute_kl_matrix(
                 if pd.isna(v_val):
                     continue
                 b0  = params[f"{v_name}_beta_0"].item()
-                bE  = params[f"{v_name}_beta_E"].detach().numpy()
+                bE_raw = params[f"{v_name}_beta_E_raw"].detach().numpy()
+                bE = expand_reference_effect_np(
+                    bE_raw,
+                    N_E,
+                    E_ENC["Calm"],
+                )
                 sig = params[f"{v_name}_sigma"].item()
                 if use_quality:
-                    bQ     = params[f"{v_name}_beta_Q"].detach().numpy()
+                    bQ_raw = params[f"{v_name}_beta_Q_raw"].detach().numpy()
+                    bQ = expand_reference_effect_np(
+                        bQ_raw,
+                        N_Q,
+                        Q_ENC["GOOD"],
+                    )
                     mu_arr = b0 + bE + bQ[q_idx]
                 else:
                     mu_arr = b0 + bE
@@ -399,10 +487,20 @@ def compute_kl_matrix_per_emotion(
                 if pd.isna(v_val):
                     continue
                 b0  = params[f"{v_name}_beta_0"].item()
-                bE  = params[f"{v_name}_beta_E"].detach().numpy()
+                bE_raw = params[f"{v_name}_beta_E_raw"].detach().numpy()
+                bE = expand_reference_effect_np(
+                    bE_raw,
+                    N_E,
+                    E_ENC["Calm"],
+                )
                 sig = params[f"{v_name}_sigma"].item()
                 if use_quality:
-                    bQ     = params[f"{v_name}_beta_Q"].detach().numpy()
+                    bQ_raw = params[f"{v_name}_beta_Q_raw"].detach().numpy()
+                    bQ = expand_reference_effect_np(
+                        bQ_raw,
+                        N_Q,
+                        Q_ENC["GOOD"],
+                    )
                     mu_arr = b0 + bE + bQ[q_idx]
                 else:
                     mu_arr = b0 + bE
