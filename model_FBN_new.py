@@ -192,8 +192,8 @@ def make_cpd_fn_V_with_quality(v_name: str, q_name: str):
             constraint=constraints.positive,
         )
 
-        e_base_idx = E_ENC["Calm"]
-        q_base_idx = Q_ENC["GOOD"]
+        e_base_idx = E_ENC[E_BASE]
+        q_base_idx = Q_ENC[Q_BASE]
 
         beta_E = expand_reference_effect(beta_E_raw, N_E, e_base_idx)
         beta_Q = expand_reference_effect(beta_Q_raw, N_Q, q_base_idx)
@@ -225,7 +225,7 @@ def make_cpd_fn_V_no_quality(v_name: str):
             constraint=constraints.positive,
         )
 
-        e_base_idx = E_ENC["Calm"]
+        e_base_idx = E_ENC[E_BASE]
         beta_E = expand_reference_effect(beta_E_raw, N_E, e_base_idx)
 
         e_idx = parents["E"].long()
@@ -340,11 +340,9 @@ def predict_E(
         log_liks = np.zeros(len(E_STATES))
 
         for cfg in MODALITIES.values():
-            q_col = cfg["q"]
-            if pd.isna(row[q_col]):
-                continue
 
             if use_quality:
+                q_col = cfg["q"]
                 if pd.isna(row[q_col]):
                     continue
                 q = int(Q_ENC[row[q_col]])
@@ -360,7 +358,7 @@ def predict_E(
                 bE = expand_reference_effect_np(
                     bE_raw,
                     N_E,
-                    E_ENC["Calm"],
+                    E_ENC[E_BASE],
                 )
                 sig = params[f"{v_name}_sigma"].item()
                 if use_quality:
@@ -368,7 +366,7 @@ def predict_E(
                     bQ = expand_reference_effect_np(
                         bQ_raw,
                         N_Q,
-                        Q_ENC["GOOD"],
+                        Q_ENC[Q_BASE],
                     )
                     mu_arr = b0 + bE + bQ[q]
                 else:
@@ -420,7 +418,7 @@ def compute_kl_matrix(
                 bE = expand_reference_effect_np(
                     bE_raw,
                     N_E,
-                    E_ENC["Calm"],
+                    E_ENC[E_BASE],
                 )
                 sig = params[f"{v_name}_sigma"].item()
                 if use_quality:
@@ -428,7 +426,7 @@ def compute_kl_matrix(
                     bQ = expand_reference_effect_np(
                         bQ_raw,
                         N_Q,
-                        Q_ENC["GOOD"],
+                        Q_ENC[Q_BASE],
                     )
                     mu_arr = b0 + bE + bQ[q_idx]
                 else:
@@ -491,7 +489,7 @@ def compute_kl_matrix_per_emotion(
                 bE = expand_reference_effect_np(
                     bE_raw,
                     N_E,
-                    E_ENC["Calm"],
+                    E_ENC[E_BASE],
                 )
                 sig = params[f"{v_name}_sigma"].item()
                 if use_quality:
@@ -499,7 +497,7 @@ def compute_kl_matrix_per_emotion(
                     bQ = expand_reference_effect_np(
                         bQ_raw,
                         N_Q,
-                        Q_ENC["GOOD"],
+                        Q_ENC[Q_BASE],
                     )
                     mu_arr = b0 + bE + bQ[q_idx]
                 else:
