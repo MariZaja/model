@@ -649,7 +649,20 @@ if __name__ == "__main__":
         print(f"\n=== {label} ({len(df)} próbek) ===")
         res = predict_E(df, params, e_prior, use_quality)
         acc = accuracy_score(res["E_true"], res["E_pred"])
-        print(f"Accuracy: {acc:.3f}  ({int(acc * len(res))}/{len(res)})\n")
+        print(f"Accuracy: {acc:.3f}  ({int(acc * len(res))}/{len(res)})")
+
+        # Accuracy per emocja = recall klasy: z okien o E_true=e ile trafiło na e
+        print("Accuracy per emocja:")
+        for e_name in E_STATES:
+            m = res["E_true"] == e_name
+            n = int(m.sum())
+            if n == 0:
+                print(f"  {e_name:6s}:   —    (brak próbek)")
+                continue
+            correct = int((res.loc[m, "E_pred"] == e_name).sum())
+            print(f"  {e_name:6s}: {correct / n:.3f}  ({correct}/{n})")
+        print()
+
         print(classification_report(
             res["E_true"],
             res["E_pred"],
